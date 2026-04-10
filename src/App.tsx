@@ -1,5 +1,6 @@
 import type { CSSProperties } from 'react';
 import { startTransition, useEffect, useMemo, useRef, useState } from 'react';
+import categorySimilarityData from '../distance/output/category_similarity.json';
 
 type AssetMap = Record<string, string[]>;
 
@@ -24,8 +25,19 @@ type LayoutOption = {
 };
 
 type PreparedRound = {
-  layoutId: string;
+  requestKey: string;
   round: RoundState;
+};
+
+type DistanceRange = {
+  min: number;
+  max: number;
+};
+
+type SimilarityEntry = {
+  category: string;
+  similarity: number;
+  support: number;
 };
 
 const modules = import.meta.glob('../object_images/*/*.{jpg,jpeg,png,webp,JPG,JPEG,PNG,WEBP}', {
@@ -33,6 +45,14 @@ const modules = import.meta.glob('../object_images/*/*.{jpg,jpeg,png,webp,JPG,JP
   query: '?url',
   import: 'default',
 }) as Record<string, string>;
+
+const rawMetadataModules = import.meta.glob('../distance/concepts-metadata_things.tsv', {
+  eager: true,
+  query: '?raw',
+  import: 'default',
+}) as Record<string, string>;
+
+const metadataRaw = Object.values(rawMetadataModules)[0] ?? '';
 
 const assetsByCategory = Object.entries(modules).reduce<AssetMap>((acc, [path, url]) => {
   const match = path.match(/object_images\/([^/]+)\//);
@@ -59,6 +79,11 @@ const layoutOptions: LayoutOption[] = [
   { id: '3x5', rows: 3, columns: 5 },
 ];
 
+const defaultDistanceRange: DistanceRange = {
+  min: 0,
+  max: 1,
+};
+
 const commonCategoriesByLayout = Object.fromEntries(
   layoutOptions.map((layout) => {
     const requiredImageCount = layout.rows * layout.columns - 1;
@@ -69,6 +94,39 @@ const commonCategoriesByLayout = Object.fromEntries(
     return [layout.id, categories];
   }),
 ) as Record<string, string[]>;
+
+const folderToSemanticCategory = metadataRaw
+  .trim()
+  .split('\n')
+  .slice(1)
+  .reduce<Record<string, string>>((acc, line) => {
+    const columns = line.split('\t');
+    const uniqueId = columns[1]?.trim();
+    const fallbackCategory = columns[20]?.trim();
+    const semanticCategory = columns[21]?.trim() || fallbackCategory || 'unknown';
+
+    if (uniqueId) {
+      acc[uniqueId] = semanticCategory;
+    }
+
+    return acc;
+  }, {});
+
+const semanticDistanceMap = Object.entries(
+  categorySimilarityData as Record<string, SimilarityEntry[]>,
+).reduce<Record<string, Record<string, number>>>((acc, [sourceCategory, entries]) => {
+  acc[sourceCategory] ??= {};
+
+  for (const entry of entries) {
+    const distance = 1 - entry.similarity;
+    acc[sourceCategory][entry.category] = distance;
+    acc[entry.category] ??= {};
+    acc[entry.category][sourceCategory] = distance;
+  }
+
+  acc[sourceCategory][sourceCategory] = 0;
+  return acc;
+}, {});
 
 const preloadedImageCache = new Map<string, Promise<void>>();
 
@@ -117,20 +175,57 @@ async function preloadRound(round: RoundState): Promise<RoundState> {
   return round;
 }
 
-function createRound(layout: LayoutOption): RoundState {
+function getDistanceBetweenFolders(commonFolder: string, oddFolder: string): number | null {
+  const commonSemantic = folderToSemanticCategory[commonFolder];
+  const oddSemantic = folderToSemanticCategory[oddFolder];
+
+  if (!commonSemantic || !oddSemantic) {
+    return null;
+  }
+
+  if (commonSemantic === oddSemantic) {
+    return 0;
+  }
+
+  return semanticDistanceMap[commonSemantic]?.[oddSemantic] ?? null;
+}
+
+function createRound(layout: LayoutOption, distanceRange: DistanceRange): RoundState {
   const imageCount = layout.rows * layout.columns;
   const commonImageCount = imageCount - 1;
-  const commonCategories = commonCategoriesByLayout[layout.id];
+  const commonCategories = commonCategoriesByLayout[layout.id].filter((commonFolder) =>
+    oddCategories.some((oddFolder) => {
+      if (oddFolder === commonFolder) {
+        return false;
+      }
+
+      const distance = getDistanceBetweenFolders(commonFolder, oddFolder);
+      return (
+        distance !== null &&
+        distance >= distanceRange.min &&
+        distance <= distanceRange.max
+      );
+    }),
+  );
 
   if (commonCategories.length < 1 || oddCategories.length < 2) {
-    throw new Error('At least two categories are required.');
+    throw new Error('No category pair matched the selected distance range.');
   }
 
   const commonCategory = sampleUnique(commonCategories, 1)[0];
-  const oddCategory = sampleUnique(
-    oddCategories.filter((category) => category !== commonCategory),
-    1,
-  )[0];
+  const oddCandidates = oddCategories.filter((oddFolder) => {
+    if (oddFolder === commonCategory) {
+      return false;
+    }
+
+    const distance = getDistanceBetweenFolders(commonCategory, oddFolder);
+    return (
+      distance !== null &&
+      distance >= distanceRange.min &&
+      distance <= distanceRange.max
+    );
+  });
+  const oddCategory = sampleUnique(oddCandidates, 1)[0];
   const commonImages = sampleUnique(assetsByCategory[commonCategory], commonImageCount);
   const oddImage = sampleUnique(assetsByCategory[oddCategory], 1)[0];
   const oddCardId = `odd-${oddCategory}-${oddImage}`;
@@ -160,11 +255,15 @@ function createRound(layout: LayoutOption): RoundState {
 
 function App() {
   const [layout, setLayout] = useState<LayoutOption>(layoutOptions[0]);
-  const [round, setRound] = useState<RoundState>(() => createRound(layoutOptions[0]));
+  const [distanceRange, setDistanceRange] = useState<DistanceRange>(defaultDistanceRange);
+  const [round, setRound] = useState<RoundState>(() =>
+    createRound(layoutOptions[0], defaultDistanceRange),
+  );
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [result, setResult] = useState<'correct' | 'wrong' | null>(null);
   const [score, setScore] = useState({ correct: 0, total: 0 });
   const [isPreparing, setIsPreparing] = useState(false);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const nextRoundRef = useRef<PreparedRound | null>(null);
 
   useEffect(() => {
@@ -173,7 +272,20 @@ function App() {
 
   useEffect(() => {
     let cancelled = false;
-    const candidateRound = createRound(layout);
+    let candidateRound: RoundState;
+
+    try {
+      candidateRound = createRound(layout, distanceRange);
+      setErrorMessage(null);
+    } catch (error) {
+      if (!cancelled) {
+        nextRoundRef.current = null;
+        setErrorMessage(error instanceof Error ? error.message : 'Failed to prepare next round.');
+      }
+      return () => {
+        cancelled = true;
+      };
+    }
 
     void preloadRound(candidateRound).then((preparedRound) => {
       if (cancelled) {
@@ -181,7 +293,7 @@ function App() {
       }
 
       nextRoundRef.current = {
-        layoutId: layout.id,
+        requestKey: `${layout.id}:${distanceRange.min.toFixed(2)}-${distanceRange.max.toFixed(2)}`,
         round: preparedRound,
       };
     });
@@ -189,24 +301,31 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [layout, round]);
+  }, [distanceRange, layout, round]);
 
   const advanceRound = async (nextLayout: LayoutOption) => {
     setIsPreparing(true);
+    const requestKey = `${nextLayout.id}:${distanceRange.min.toFixed(2)}-${distanceRange.max.toFixed(2)}`;
 
-    const prepared =
-      nextRoundRef.current?.layoutId === nextLayout.id
-        ? nextRoundRef.current.round
-        : await preloadRound(createRound(nextLayout));
+    try {
+      const prepared =
+        nextRoundRef.current?.requestKey === requestKey
+          ? nextRoundRef.current.round
+          : await preloadRound(createRound(nextLayout, distanceRange));
 
-    nextRoundRef.current = null;
+      nextRoundRef.current = null;
 
-    startTransition(() => {
-      setRound(prepared);
-      setSelectedId(null);
-      setResult(null);
+      startTransition(() => {
+        setRound(prepared);
+        setSelectedId(null);
+        setResult(null);
+        setErrorMessage(null);
+        setIsPreparing(false);
+      });
+    } catch (error) {
       setIsPreparing(false);
-    });
+      setErrorMessage(error instanceof Error ? error.message : 'Failed to prepare next round.');
+    }
   };
 
   useEffect(() => {
@@ -219,7 +338,7 @@ function App() {
     }, 900);
 
     return () => window.clearTimeout(timer);
-  }, [layout, result]);
+  }, [distanceRange, layout, result]);
 
   const statusText = useMemo(() => {
     if (result === 'correct') {
@@ -230,6 +349,11 @@ function App() {
     }
     return '異なるものを1つ選んでください';
   }, [result]);
+
+  const currentDistance = useMemo(
+    () => getDistanceBetweenFolders(round.commonCategory, round.oddCategory),
+    [round.commonCategory, round.oddCategory],
+  );
 
   const handleSelect = (card: Card) => {
     if (result) {
@@ -256,6 +380,30 @@ function App() {
     void advanceRound(nextLayout);
   };
 
+  const handleDistanceMinChange = (value: number) => {
+    const nextRange = {
+      min: Math.min(value, distanceRange.max),
+      max: distanceRange.max,
+    };
+
+    setDistanceRange(nextRange);
+    nextRoundRef.current = null;
+  };
+
+  const handleDistanceMaxChange = (value: number) => {
+    const nextRange = {
+      min: distanceRange.min,
+      max: Math.max(value, distanceRange.min),
+    };
+
+    setDistanceRange(nextRange);
+    nextRoundRef.current = null;
+  };
+
+  useEffect(() => {
+    void advanceRound(layout);
+  }, [distanceRange]);
+
   return (
     <main className={`app ${result ?? 'idle'}`}>
       <header className="hud">
@@ -264,18 +412,53 @@ function App() {
           <p className="score">
             Score {score.correct} / {score.total}
           </p>
+          <p className="distance-readout">
+            Distance {distanceRange.min.toFixed(2)} - {distanceRange.max.toFixed(2)}
+          </p>
+          {currentDistance !== null ? (
+            <p className="distance-readout">Current pair {currentDistance.toFixed(2)}</p>
+          ) : null}
+          {errorMessage ? <p className="error-text">{errorMessage}</p> : null}
         </div>
-        <div className="layout-picker" aria-label="layout selector">
-          {layoutOptions.map((option) => (
-            <button
-              key={option.id}
-              type="button"
-              className={`layout-button${option.id === layout.id ? ' active' : ''}`}
-              onClick={() => handleLayoutChange(option)}
-            >
-              {option.id}
-            </button>
-          ))}
+        <div className="controls">
+          <div className="layout-picker" aria-label="layout selector">
+            {layoutOptions.map((option) => (
+              <button
+                key={option.id}
+                type="button"
+                className={`layout-button${option.id === layout.id ? ' active' : ''}`}
+                onClick={() => handleLayoutChange(option)}
+              >
+                {option.id}
+              </button>
+            ))}
+          </div>
+          <div className="distance-controls">
+            <label className="distance-label" htmlFor="distance-min">
+              Min
+            </label>
+            <input
+              id="distance-min"
+              type="range"
+              min="0"
+              max="1"
+              step="0.05"
+              value={distanceRange.min}
+              onChange={(event) => handleDistanceMinChange(Number(event.target.value))}
+            />
+            <label className="distance-label" htmlFor="distance-max">
+              Max
+            </label>
+            <input
+              id="distance-max"
+              type="range"
+              min="0"
+              max="1"
+              step="0.05"
+              value={distanceRange.max}
+              onChange={(event) => handleDistanceMaxChange(Number(event.target.value))}
+            />
+          </div>
         </div>
       </header>
 
